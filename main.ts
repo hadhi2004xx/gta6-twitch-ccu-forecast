@@ -15,10 +15,9 @@
 //     day's peak behaves like a rolling-midnight launch; one whose hour 1
 //     was nearly empty is a single global unlock later in the UTC day. The
 //     case's notes say which regime the target launch is in, which sets the
-//     share the weights aim at.
+//     share the weights aim at;
 //   - platform overlap between the comparable's platforms and the platforms
-//     the case's notes name;
-//   - recency: recent launches resemble the current Twitch better.
+//     the case's notes name.
 // The empirical weighted quantiles are then shrunk a little in log space:
 // the median toward flat (ratio 1) and the spread by a fixed factor, both
 // calibrated by leave-one-out backtests over the comparable set.
@@ -44,7 +43,7 @@ const FLOOR_Q = 0.01;
  * comparable launches (see SUBMIT-RESUME.md). Kept on one line so the
  * tuning harness can substitute variants.
  */
-const TUNE = { shareStarRolling: 0.45, shareStarGlobal: 0.02, shareStarOther: 0.3, shareSigma: 2.0, platformMatch: 1.6, recentBoost: 1.0, recentYear: 2023, medShrink: 0.78, spreadScale: 0.9 };
+const TUNE = { shareStarRolling: 0.45, shareStarGlobal: 0.02, shareStarOther: 0.3, shareSigma: 2.0, platformMatch: 1.6, medShrink: 0.78, spreadScale: 0.9 };
 
 interface HourlyPoint {
   from: string;
@@ -83,7 +82,7 @@ function releaseDayCurve(comp: Comparable): (number | null)[] | null {
   const start = Date.parse(comp.day_start);
   if (!Number.isFinite(start)) return null;
   const curve: (number | null)[] = new Array(25).fill(null);
-  for (const point of comp.hourly) {
+  for (const point of comp.hourly ?? []) {
     const t = Date.parse(point.from);
     if (!Number.isFinite(t)) continue;
     const hour = Math.floor((t - start) / 3_600_000) + 1;
@@ -146,34 +145,58 @@ function platformTokens(text: string): Set<string> {
 
 /** A usable comparable, pre-digested once per case. */
 interface CompDay {
-  curve: (number | null)[];
+  /** ln(viewers_h / viewers_1) per UTC hour 1..24, null where unsampled. */
+  logRatios: (number | null)[];
   /** Hour-1 viewers as a share of the day's peak, in (0, 1]. */
   share: number;
-  /** Release year, for the recency weight. */
-  year: number;
   platforms: Set<string>;
 }
 
 function digestComparable(comp: Comparable): CompDay | null {
   const curve = releaseDayCurve(comp);
   if (curve === null) return null;
+  const base = curve[1] as number;
   let peak = 0;
   for (let h = 1; h <= 24; h++) peak = Math.max(peak, curve[h] ?? 0);
-  const year = Number(comp.day_start.slice(0, 4)) || 0;
-  return { curve, share: (curve[1] as number) / peak, year, platforms: platformTokens(comp.platforms) };
+  const logRatios = curve.map((v) => (v === null ? null : Math.log(v / base)));
+  return { logRatios, share: base / peak, platforms: platformTokens(comp.platforms ?? '') };
 }
 
-/** Similarity weight of one comparable for this case. */
-function weightOf(day: CompDay, shareStar: number, casePlatforms: Set<string>): number {
-  const dLog = Math.log(day.share) - Math.log(shareStar);
-  let w = Math.exp(-(dLog * dLog) / (2 * TUNE.shareSigma * TUNE.shareSigma));
-  if (casePlatforms.size > 0 && day.platforms.size > 0) {
-    let overlap = 0;
-    for (const token of day.platforms) if (casePlatforms.has(token)) overlap++;
-    if (overlap > 0) w *= TUNE.platformMatch;
+/** The weighted training pool for one case. */
+interface Pool {
+  days: CompDay[];
+  weights: number[];
+}
+
+function buildPool(c: CaseFile, p1: number): Pool {
+  let regime = regimeOf(c.notes ?? '');
+  if (regime === 'other') regime = regimeFromHistory(c, p1);
+  const shareStar =
+    regime === 'rolling' ? TUNE.shareStarRolling : regime === 'global' ? TUNE.shareStarGlobal : TUNE.shareStarOther;
+  const casePlatforms = platformTokens(c.notes ?? '');
+  const gameName = c.game.name.toLowerCase();
+  const days: CompDay[] = [];
+  const weights: number[] = [];
+  for (const comp of c.comparables ?? []) {
+    // A launch never trains on itself; the case game's own pre-release
+    // category history is not a launch either.
+    if (comp.name.toLowerCase().includes(gameName)) continue;
+    const day = digestComparable(comp);
+    if (day === null) continue;
+    const dLog = Math.log(day.share) - Math.log(shareStar);
+    let w = Math.exp(-(dLog * dLog) / (2 * TUNE.shareSigma * TUNE.shareSigma));
+    if (casePlatforms.size > 0 && day.platforms.size > 0) {
+      for (const token of day.platforms) {
+        if (casePlatforms.has(token)) {
+          w *= TUNE.platformMatch;
+          break;
+        }
+      }
+    }
+    days.push(day);
+    weights.push(w);
   }
-  if (day.year >= TUNE.recentYear) w *= TUNE.recentBoost;
-  return w;
+  return { days, weights };
 }
 
 /** Weighted quantile: value at cumulative-weight fraction tau. */
@@ -212,35 +235,19 @@ function shapeRow(raw: number[]): number[] {
   return out;
 }
 
-/** Forecast one case: 23 rows of five quantiles for hours 2..24. */
+/** Forecast one case: one row of five quantiles per forecast hour. */
 function forecastCase(c: CaseFile): Array<{ hour: number; q: number[] }> {
   const first = c.known.find((k) => k.hour === 1);
   const p1 = Math.max(1, first?.viewers ?? 1);
-  let regime = regimeOf(c.notes ?? '');
-  if (regime === 'other') regime = regimeFromHistory(c, p1);
-  const shareStar =
-    regime === 'rolling' ? TUNE.shareStarRolling : regime === 'global' ? TUNE.shareStarGlobal : TUNE.shareStarOther;
-  const casePlatforms = platformTokens(c.notes ?? '');
-  const gameName = c.game.name.toLowerCase();
-
-  const days: CompDay[] = [];
-  const weights: number[] = [];
-  for (const comp of c.comparables) {
-    if (comp.name.toLowerCase().includes(gameName)) continue;
-    const day = digestComparable(comp);
-    if (day === null) continue;
-    days.push(day);
-    weights.push(weightOf(day, shareStar, casePlatforms));
-  }
-
+  const pool = buildPool(c, p1);
   return c.forecast.map(({ hour }) => {
     const logRatios: number[] = [];
     const ws: number[] = [];
-    days.forEach((day, i) => {
-      const v = day.curve[hour];
-      if (v !== null) {
-        logRatios.push(Math.log(v / (day.curve[1] as number)));
-        ws.push(weights[i]);
+    pool.days.forEach((day, i) => {
+      const lr = day.logRatios[hour];
+      if (lr !== null && lr !== undefined) {
+        logRatios.push(lr);
+        ws.push(pool.weights[i]);
       }
     });
     if (logRatios.length === 0) {
